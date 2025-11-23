@@ -1,9 +1,18 @@
-use aniapi::{export_plugin, CommandSpec, Context, Event, Plugin, Result};
+use aniapi::{export_plugin, Context, Event, Plugin, Result};
 use async_trait::async_trait;
-use tracing::info;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+const MASTER_VOICE_CHANNEL: u64 = 1366403705460621359;
+const CATEGORY_ID: u64 = 1366403705460621357;
+const ALLOWED_GUILD_ID: u64 = 1366403704130900018;
 
 #[derive(Default)]
-pub struct VoiceTempPlugin;
+pub struct VoiceTempPlugin {
+    // Map: user_id -> created channel_id
+    temp_channels: Arc<Mutex<HashMap<u64, u64>>>,
+}
 
 #[async_trait]
 impl Plugin for VoiceTempPlugin {
@@ -11,72 +20,141 @@ impl Plugin for VoiceTempPlugin {
         "VoiceTempPlugin"
     }
 
-    fn commands(&self) -> Vec<CommandSpec> {
-        vec![
-            CommandSpec::new("create_temp", "Create a temporary voice channel"),
-        ]
-    }
+    async fn on_load(&mut self, ctx: &Context) -> Result<()> {
+        // Setup logging redirection via log crate
+        if let Some(logger) = ctx.logger {
+            log::set_logger(logger).ok();
+            log::set_max_level(log::LevelFilter::Info);
+        }
 
-    async fn on_load(&mut self, _ctx: &Context) -> Result<()> {
-        info!("VoiceTempPlugin loaded!");
+        log::info!("VoiceTempPlugin loaded! (log crate)");
         Ok(())
     }
 
     async fn on_unload(&mut self, _ctx: &Context) -> Result<()> {
-        info!("VoiceTempPlugin unloaded!");
+        log::info!("VoiceTempPlugin unloaded! (log crate)");
         Ok(())
     }
 
     async fn on_event(&mut self, event: &Event, ctx: &Context) -> Result<()> {
         match event {
-            Event::Interaction(interaction) => {
-                if let serenity::model::application::Interaction::Command(command) = interaction.as_ref() {
-                    match command.data.name.as_str() {
-                        "create_temp" => {
-                            if let Some(guild_id) = command.guild_id {
-                                if let Some(guild_mgr) = &ctx.guild {
-                                    match guild_mgr.create_voice_channel(guild_id.get(), "Temp Channel", None).await {
-                                        Ok(channel_id) => {
-                                            // Move user to new channel if they are in one
-                                            // Note: We need to know if user is in a channel. 
-                                            // Without full cache, we assume user might be in the channel they triggered this from?
-                                            // Or we just create it.
-                                            
-                                            let response = serenity::builder::CreateInteractionResponseMessage::new()
-                                                .content(format!("Created temporary channel: <#{}>", channel_id));
-                                            let builder = serenity::builder::CreateInteractionResponse::Message(response);
-                                            if let Some(responder) = &ctx.responder {
-                                                let _ = responder.respond(command.id.get(), &command.token, builder).await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let response = serenity::builder::CreateInteractionResponseMessage::new()
-                                                .content(format!("Failed to create channel: {:?}", e));
-                                            let builder = serenity::builder::CreateInteractionResponse::Message(response);
-                                            if let Some(responder) = &ctx.responder {
-                                                let _ = responder.respond(command.id.get(), &command.token, builder).await;
-                                            }
-                                        }
+            Event::VoiceStateUpdate(state) => {
+                let state_guild_id = state.guild_id.map(|id| id.get());
+                if state_guild_id != Some(ALLOWED_GUILD_ID) {
+                    return Ok(());
+                }
+                let user_id = state.user_id.get();
+                let cur_chan = state.channel_id.map(|id| id.get());
+
+                if let Some(channel_id) = cur_chan {
+                    // User joined a channel
+                    if channel_id == MASTER_VOICE_CHANNEL {
+                        // User joined master channel: create temp channel and move them to it
+                        if let Some(guild_mgr) = &ctx.guild {
+                            if let Some(guild_id) = state.guild_id.map(|id| id.get()) {
+                                let mut skip = false;
+                                {
+                                    let map = self.temp_channels.lock().await;
+                                    if map.contains_key(&user_id) {
+                                        skip = true;
+                                    }
+                                }
+                                if skip {
+                                    log::info!(
+                                        "User {} already has a temp channel, skipping creation.",
+                                        user_id
+                                    );
+                                    return Ok(());
+                                }
+
+                                match guild_mgr
+                                    .create_voice_channel(
+                                        guild_id,
+                                        &format!("🔊 {}'s Room", user_id),
+                                        Some(CATEGORY_ID),
+                                    )
+                                    .await
+                                {
+                                    Ok(temp_channel_id) => {
+                                        // Move user into the new channel
+                                        let _ = guild_mgr
+                                            .move_member(guild_id, user_id, temp_channel_id)
+                                            .await;
+                                        log::info!(
+                                            "Created temp channel {} and moved user {}",
+                                            temp_channel_id, user_id
+                                        );
+                                        // Track user <-> channel mapping
+                                        let mut map = self.temp_channels.lock().await;
+                                        map.insert(user_id, temp_channel_id);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to create temp channel for {}: {:?}",
+                                            user_id, e
+                                        );
                                     }
                                 }
                             }
                         }
-                        _ => {}
+                    } else {
+                        // User joined any other channel
+                        // Only delete previous temp channel if they left it
+                        let prev_chan_id = {
+                            let map = self.temp_channels.lock().await;
+                            map.get(&user_id).copied()
+                        };
+                        // If the user is moving out of their temp channel (i.e., prev_chan exists and is not the current channel)
+                        if let Some(user_temp_channel_id) = prev_chan_id {
+                            if channel_id != user_temp_channel_id {
+                                // Remove mapping and delete temp channel
+                                let mut map = self.temp_channels.lock().await;
+                                map.remove(&user_id);
+                                if let Some(guild_mgr) = &ctx.guild {
+                                    if let Err(e) = guild_mgr.delete_channel(user_temp_channel_id).await {
+                                        log::warn!(
+                                            "Failed to delete temp channel {} after user {} switched: {:?}",
+                                            user_temp_channel_id, user_id, e
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "Deleted temp channel {} after user {} switched channel",
+                                            user_temp_channel_id, user_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // User left all voice channels
+                    // Check if user had a temp channel, and delete if present
+                    let prev_chan_id = {
+                        let map = self.temp_channels.lock().await;
+                        map.get(&user_id).copied()
+                    };
+                    if let Some(user_temp_channel_id) = prev_chan_id {
+                        // User left all -- so they left their temp channel
+                        let mut map = self.temp_channels.lock().await;
+                        map.remove(&user_id);
+                        if let Some(guild_mgr) = &ctx.guild {
+                            if let Err(e) = guild_mgr.delete_channel(user_temp_channel_id).await {
+                                log::warn!(
+                                    "Failed to delete temp channel {} after user {} left: {:?}",
+                                    user_temp_channel_id, user_id, e
+                                );
+                            } else {
+                                log::info!(
+                                    "Deleted temp channel {} after user {} left all channels",
+                                    user_temp_channel_id, user_id
+                                );
+                            }
+                        }
                     }
                 }
             }
-            Event::VoiceStateUpdate(state) => {
-                // Logic for temp channels:
-                // If user joins "Master" channel -> Create Temp -> Move User
-                // If Temp channel empty -> Delete
-                
-                // For now just log
-                 if let Some(channel_id) = state.channel_id {
-                    info!("User {} joined channel {}", state.user_id, channel_id);
-                 }
-            }
             Event::System(e) => {
-                info!("VoiceTempPlugin received system event: {:?}", e);
+                log::info!("VoiceTempPlugin received system event: {:?}", e);
             }
             _ => {}
         }
