@@ -3,15 +3,30 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use serde::Deserialize;
 
-const MASTER_VOICE_CHANNEL: u64 = 1366403705460621359;
-const CATEGORY_ID: u64 = 1366403705460621357;
-const ALLOWED_GUILD_ID: u64 = 1366403704130900018;
+#[derive(Deserialize, Clone, Debug)]
+pub struct Config {
+    pub master_channel_id: u64,
+    pub category_id: u64,
+    pub allowed_guild_id: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            master_channel_id: 1366403705460621359,
+            category_id: 1366403705460621357,
+            allowed_guild_id: 1366403704130900018,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct VoiceTempPlugin {
     // Map: user_id -> created channel_id
     temp_channels: Arc<Mutex<HashMap<u64, u64>>>,
+    config: Arc<Mutex<Option<Config>>>,
 }
 
 #[async_trait]
@@ -27,7 +42,45 @@ impl Plugin for VoiceTempPlugin {
             log::set_max_level(log::LevelFilter::Info);
         }
 
-        log::info!("VoiceTempPlugin loaded! (log crate)");
+        // Load configuration
+        if let Some(config_mgr) = &ctx.config {
+            match config_mgr.get_config(self.name()).await {
+                Ok(Some(toml_value)) => {
+                    // Convert toml::Value to string and back for deserialization
+                    let toml_str = toml::to_string(&toml_value)
+                        .map_err(|e| aniapi::Error::System(format!("Failed to serialize toml value: {}", e)))?;
+                    match toml::from_str::<Config>(&toml_str) {
+                        Ok(config) => {
+                            let mut stored_config = self.config.lock().await;
+                            *stored_config = Some(config.clone());
+                            log::info!("VoiceTempPlugin loaded with config: master_channel={}, category={}, guild={}", 
+                                config.master_channel_id, config.category_id, config.allowed_guild_id);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to deserialize config for VoiceTempPlugin: {}. Using defaults.", e);
+                            let mut stored_config = self.config.lock().await;
+                            *stored_config = Some(Config::default());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log::warn!("No config file found for VoiceTempPlugin. Using defaults.");
+                    let mut stored_config = self.config.lock().await;
+                    *stored_config = Some(Config::default());
+                }
+                Err(e) => {
+                    log::error!("Error loading config for VoiceTempPlugin: {}. Using defaults.", e);
+                    let mut stored_config = self.config.lock().await;
+                    *stored_config = Some(Config::default());
+                }
+            }
+        } else {
+            log::warn!("ConfigManager not available. Using defaults.");
+            let mut stored_config = self.config.lock().await;
+            *stored_config = Some(Config::default());
+        }
+
+        log::info!("VoiceTempPlugin loaded!");
         Ok(())
     }
 
@@ -37,10 +90,16 @@ impl Plugin for VoiceTempPlugin {
     }
 
     async fn on_event(&mut self, event: &Event, ctx: &Context) -> Result<()> {
+        // Get config (with fallback to defaults)
+        let config = {
+            let stored = self.config.lock().await;
+            stored.clone().unwrap_or_else(Config::default)
+        };
+
         match event {
             Event::VoiceStateUpdate(state) => {
                 let state_guild_id = state.guild_id.map(|id| id.get());
-                if state_guild_id != Some(ALLOWED_GUILD_ID) {
+                if state_guild_id != Some(config.allowed_guild_id) {
                     return Ok(());
                 }
                 let user_id = state.user_id.get();
@@ -48,7 +107,7 @@ impl Plugin for VoiceTempPlugin {
 
                 if let Some(channel_id) = cur_chan {
                     // User joined a channel
-                    if channel_id == MASTER_VOICE_CHANNEL {
+                    if channel_id == config.master_channel_id {
                         // User joined master channel: create temp channel and move them to it
                         if let Some(guild_mgr) = &ctx.guild {
                             if let Some(guild_id) = state.guild_id.map(|id| id.get()) {
@@ -71,7 +130,7 @@ impl Plugin for VoiceTempPlugin {
                                     .create_voice_channel(
                                         guild_id,
                                         &format!("🔊 {}'s Room", user_id),
-                                        Some(CATEGORY_ID),
+                                        Some(config.category_id),
                                     )
                                     .await
                                 {
